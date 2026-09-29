@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: professional-grass
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: CLIENT_ID
+        sync: false
+      - key: CLIENT_SECRET
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: OAUTH_REDIRECT_URI
+        sync: false
