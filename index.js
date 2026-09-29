@@ -438,7 +438,10 @@ http
         res.writeHead(200, { "Content-Type": "text/plain" });
         res.end("Professional Grass is alive 🌱");
     })
-    .listen(PORT, "0.0.0.0", () => {\n        console.log(`🌐 HTTP server listening on ${PORT}`);\n        console.log(`🌐 OAuth callback path: /callback`);\n    });
+    .listen(PORT, "0.0.0.0", () => {
+        console.log(`🌐 HTTP server listening on ${PORT}`);
+        console.log(`🌐 OAuth callback path: /callback`);
+    });
 
 
 // ==========================================================
