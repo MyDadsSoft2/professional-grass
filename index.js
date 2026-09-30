@@ -30,7 +30,7 @@ const CLIENT_SECRET = process.env.CLIENT_SECRET;
 const OWNER_ID = process.env.OWNER_ID;
 const OAUTH_REDIRECT_URI = process.env.OAUTH_REDIRECT_URI;
 const PRIVACY_URL = process.env.PRIVACY_URL || null;
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.SERVER_PORT || process.env.PORT || 3000;
 
 for (const [key, value] of Object.entries({
     BOT_TOKEN: TOKEN,
@@ -58,7 +58,9 @@ const DEFAULT_DATABASE = {
     whitelists: {},
     detections: [],
     // userId -> { username, matches: [{id, name}], checkedAt }
-    verifications: {}
+    verifications: {},
+    // userId -> { username, firstCaughtAt, lastCaughtAt, count, matches: [{id, name}] }
+    caughtUsers: {}
 };
 
 function cloneDefaultDatabase() {
@@ -93,6 +95,32 @@ function loadDatabase() {
         data.whitelists ??= {};
         data.detections ??= [];
         data.verifications ??= {};
+        data.caughtUsers ??= {};
+
+        // Add verification deadline defaults to existing server configs.
+        for (const config of Object.values(data.guilds)) {
+            config.verificationDeadlineDays ??= 7;
+            config.kickUnverified ??= false;
+        }
+
+        // Rebuild caughtUsers from older detection history if upgrading an existing database.
+        for (const item of data.detections) {
+            if (!item?.userId || !Array.isArray(item.matches)) continue;
+            const existing = data.caughtUsers[item.userId] || {
+                username: null,
+                firstCaughtAt: item.detectedAt || new Date().toISOString(),
+                lastCaughtAt: item.detectedAt || new Date().toISOString(),
+                count: 0,
+                matches: []
+            };
+            existing.count += 1;
+            existing.lastCaughtAt = item.detectedAt || existing.lastCaughtAt;
+            const byId = new Map((existing.matches || []).map(m => [m.id, m]));
+            for (const m of item.matches) byId.set(m.id, { id: m.id, name: m.name });
+            existing.matches = [...byId.values()];
+            data.caughtUsers[item.userId] = existing;
+        }
+
         return data;
     } catch (error) {
         console.error("❌ Database load failed:", error);
@@ -127,6 +155,8 @@ function createGuildConfig(guildId) {
             staffRoleId: null,
             verifiedRoleId: null,
             autoScan: true,
+            verificationDeadlineDays: 7,
+            kickUnverified: false,
             configuredAt: null
         };
         saveDatabase();
@@ -395,6 +425,152 @@ function isVerified(userId) {
     return Boolean(database.verifications[userId]);
 }
 
+// Server-specific verification: the configured Verified role is authoritative.
+// This prevents a Verified role in Server A from automatically exempting a
+// member from Server B's verification requirement.
+function hasGuildVerifiedRole(member) {
+    const config = getGuildConfig(member.guild.id);
+    return Boolean(config?.verifiedRoleId && member.roles.cache.has(config.verifiedRoleId));
+}
+
+function isVerifiedInGuild(member) {
+    return hasGuildVerifiedRole(member);
+}
+
+// User IDs seen with a configured Verified role in ANY server using the bot.
+// If a user is in this set, the 7-day rule will not kick them from another server.
+const globallyRoleVerifiedUsers = new Set();
+
+function rebuildGlobalRoleVerificationCache() {
+    globallyRoleVerifiedUsers.clear();
+
+    for (const guild of client.guilds.cache.values()) {
+        const config = getGuildConfig(guild.id);
+        if (!config?.verifiedRoleId) continue;
+
+        for (const member of guild.members.cache.values()) {
+            if (member.user.bot) continue;
+            if (member.roles.cache.has(config.verifiedRoleId)) {
+                globallyRoleVerifiedUsers.add(member.id);
+            }
+        }
+    }
+}
+
+function isVerifiedAnywhere(userId) {
+    // OAuth verification records are also accepted globally.
+    return globallyRoleVerifiedUsers.has(userId) || isVerified(userId);
+}
+
+function verificationDeadlineTimestamp(member, days = 7) {
+    return member.joinedTimestamp + days * 24 * 60 * 60 * 1000;
+}
+
+// Import members who already have a configured Verified role in ANY server
+// using Professional Grass. Verification is global by Discord user ID, so
+// once found verified in one configured server they are recognised as
+// verified in every other server using the bot.
+async function getGuildMembersForMaintenance(guild, forceFetch = false) {
+    // Prefer the existing cache. A full guild.members.fetch() uses Discord
+    // Gateway Opcode 8, which is heavily rate-limited.
+    if (!forceFetch && guild.members.cache.size > 1) {
+        return guild.members.cache;
+    }
+
+    try {
+        return await guild.members.fetch();
+    } catch (error) {
+        if (error?.data?.opcode === 8 && error?.data?.retry_after) {
+            console.warn(
+                `Member fetch rate-limited in ${guild.name}; using ${guild.members.cache.size} cached member(s) instead.`
+            );
+            return guild.members.cache;
+        }
+        throw error;
+    }
+}
+
+// Import members who already have a configured Verified role in ANY server.
+// Pass a member collection when available so we never fetch the same guild twice.
+async function syncExistingVerifiedMembers(guild = null, suppliedMembers = null) {
+    // Existing Verified roles do not need to be copied into the global OAuth
+    // verification database. The role itself is the per-server source of truth.
+    // We only count/log them here so staff can see the sync is working.
+    let recognised = 0;
+    const guilds = guild ? [guild] : [...client.guilds.cache.values()];
+
+    for (const currentGuild of guilds) {
+        const config = getGuildConfig(currentGuild.id);
+        if (!config?.verifiedRoleId) continue;
+
+        let members = suppliedMembers;
+        if (!members || guilds.length > 1) {
+            try {
+                members = await getGuildMembersForMaintenance(currentGuild);
+            } catch (error) {
+                console.error(`Couldn't inspect verified members in ${currentGuild.name}:`, error.message);
+                continue;
+            }
+        }
+
+        for (const member of members.values()) {
+            if (member.user.bot) continue;
+            if (member.roles.cache.has(config.verifiedRoleId)) recognised++;
+        }
+    }
+
+    if (recognised > 0) {
+        console.log(`✅ Recognised ${recognised} member(s) with configured Verified roles.`);
+    }
+
+    return recognised;
+}
+
+async function enforceVerificationDeadlines(guild = null, suppliedMembers = null) {
+    // SAFETY MODE: never kick automatically.
+    // This only identifies overdue users and logs them. Automatic removal is
+    // intentionally disabled so existing members are not mass-kicked simply
+    // because they joined the server more than seven days ago.
+    const guilds = guild ? [guild] : [...client.guilds.cache.values()];
+
+    for (const currentGuild of guilds) {
+        const config = getGuildConfig(currentGuild.id);
+        if (!config) continue;
+
+        const days = Number(config.verificationDeadlineDays || 7);
+
+        let members = suppliedMembers;
+        if (!members || guilds.length > 1) {
+            try {
+                members = await getGuildMembersForMaintenance(currentGuild);
+            } catch (error) {
+                console.error(`Couldn't check verification deadlines in ${currentGuild.name}:`, error.message);
+                continue;
+            }
+        }
+
+        const now = Date.now();
+        const overdue = [];
+
+        for (const member of members.values()) {
+            if (member.user.bot) continue;
+            if (isWhitelisted(currentGuild.id, member.id)) continue;
+            if (isVerifiedAnywhere(member.id)) continue;
+            if (!member.joinedTimestamp) continue;
+
+            const deadline = verificationDeadlineTimestamp(member, days);
+            if (deadline <= now) overdue.push(member);
+        }
+
+        if (overdue.length) {
+            console.warn(
+                `⚠️ ${overdue.length} unverified member(s) in ${currentGuild.name} are older than ${days} days. ` +
+                `NO ONE was kicked — automatic kicking is disabled for safety.`
+            );
+        }
+    }
+}
+
 // ==========================================================
 // HTTP SERVER (OAuth callback)
 // ==========================================================
@@ -441,6 +617,7 @@ http
     .listen(PORT, "0.0.0.0", () => {
         console.log(`🌐 HTTP server listening on ${PORT}`);
         console.log(`🌐 OAuth callback path: /callback`);
+        console.log(`🌐 Public callback: ${OAUTH_REDIRECT_URI}`);
     });
 
 
@@ -493,12 +670,35 @@ async function checkUserAgainstLeakServers(userId) {
 // ==========================================================
 
 function saveDetection(protectedGuildId, userId, matches) {
+    const detectedAt = new Date().toISOString();
+    const cleanMatches = matches.map(match => ({ id: match.id, name: match.name }));
+
     database.detections.push({
         protectedGuildId,
         userId,
-        matches: matches.map(match => ({ id: match.id, name: match.name })),
-        detectedAt: new Date().toISOString()
+        matches: cleanMatches,
+        detectedAt
     });
+
+    // Keep a permanent caught-user record even if the rolling detection log is trimmed.
+    database.caughtUsers ??= {};
+    const existing = database.caughtUsers[userId] || {
+        username: database.verifications[userId]?.username || null,
+        firstCaughtAt: detectedAt,
+        lastCaughtAt: detectedAt,
+        count: 0,
+        matches: []
+    };
+
+    existing.username = database.verifications[userId]?.username || existing.username;
+    existing.lastCaughtAt = detectedAt;
+    existing.count += 1;
+
+    const matchMap = new Map((existing.matches || []).map(match => [match.id, match]));
+    for (const match of cleanMatches) matchMap.set(match.id, match);
+    existing.matches = [...matchMap.values()];
+
+    database.caughtUsers[userId] = existing;
 
     if (database.detections.length > 5000) {
         database.detections = database.detections.slice(-5000);
@@ -635,7 +835,7 @@ async function registerCommands() {
 // READY
 // ==========================================================
 
-client.once("ready", () => {
+client.once("clientReady", () => {
     console.log("\n==========================================");
     console.log("🌱 PROFESSIONAL GRASS ONLINE");
     console.log("==========================================");
@@ -644,9 +844,39 @@ client.once("ready", () => {
     console.log(`Configured servers: ${Object.keys(database.guilds).length}`);
     console.log(`Known leak servers: ${Object.keys(database.leakServers).length}`);
     console.log(`Verified users: ${Object.keys(database.verifications).length}`);
+    console.log(`Caught users: ${Object.keys(database.caughtUsers || {}).length}`);
+    console.log(`Detection records: ${database.detections.length}`);
+    console.log(`Database file: ${DATA_FILE}`);
     console.log("==========================================\n");
 
     client.user.setActivity("for dodgy grass 🌱");
+
+    // One member collection per guild is shared by verified-role sync and
+    // deadline enforcement. This avoids duplicate Gateway Opcode 8 requests.
+    const runMemberMaintenance = async () => {
+        for (const guild of client.guilds.cache.values()) {
+            let members;
+            try {
+                members = await getGuildMembersForMaintenance(guild);
+            } catch (error) {
+                console.error(`Member maintenance failed in ${guild.name}:`, error.message);
+                continue;
+            }
+
+            await syncExistingVerifiedMembers(guild, members);
+        }
+
+        // All guild caches have now been inspected. Build one global verified
+        // set before enforcing any server's deadline.
+        rebuildGlobalRoleVerificationCache();
+
+        for (const guild of client.guilds.cache.values()) {
+            await enforceVerificationDeadlines(guild, guild.members.cache);
+        }
+    };
+
+    setTimeout(() => runMemberMaintenance().catch(console.error), 15 * 1000);
+    setInterval(() => runMemberMaintenance().catch(console.error), 60 * 60 * 1000);
 });
 
 client.on("guildCreate", guild => {
@@ -657,6 +887,34 @@ client.on("guildCreate", guild => {
 client.on("guildDelete", guild => {
     deleteGuildConfig(guild.id);
     console.log(`➖ Removed from: ${guild.name} (${guild.id})`);
+});
+
+// ==========================================================
+// VERIFIED ROLE TRACKING
+// Uses role-change events instead of repeatedly fetching the full member list.
+// ==========================================================
+
+client.on("guildMemberUpdate", async (oldMember, newMember) => {
+    try {
+        if (newMember.user.bot) return;
+
+        const config = getGuildConfig(newMember.guild.id);
+        if (!config?.verifiedRoleId) return;
+
+        const hadRole = oldMember.roles.cache.has(config.verifiedRoleId);
+        const hasRole = newMember.roles.cache.has(config.verifiedRoleId);
+
+        if (!hadRole && hasRole) {
+            console.log(`✅ ${newMember.user.tag} gained the Verified role in ${newMember.guild.name}.`);
+            globallyRoleVerifiedUsers.add(newMember.id);
+        } else if (hadRole && !hasRole) {
+            console.log(`⚪ ${newMember.user.tag} lost the Verified role in ${newMember.guild.name}.`);
+            // They may still have a Verified role in another configured server.
+            rebuildGlobalRoleVerificationCache();
+        }
+    } catch (error) {
+        console.error("Verified role update tracking failed:", error);
+    }
 });
 
 // ==========================================================
@@ -921,6 +1179,11 @@ client.on("interactionCreate", async interaction => {
                                 value: config.autoScan ? "✅ Enabled" : "❌ Disabled",
                                 inline: true
                             },
+                            {
+                                name: "⏳ Verification Deadline",
+                                value: "⚠️ Auto-kick disabled (safe mode)",
+                                inline: true
+                            },
                             { name: "📋 Whitelisted", value: String(whitelistCount), inline: true },
                             { name: "🌐 App Servers", value: String(client.guilds.cache.size), inline: true }
                         )
@@ -976,7 +1239,12 @@ client.on("interactionCreate", async interaction => {
 
             if (!matches.length) {
                 return interaction.editReply({
-                    embeds: [isVerified(user.id) ? clearEmbed(user) : unverifiedEmbed(user)]
+                    embeds: [
+                        interaction.guild.members.cache.get(user.id) &&
+                        isVerifiedInGuild(interaction.guild.members.cache.get(user.id))
+                            ? clearEmbed(user)
+                            : unverifiedEmbed(user)
+                    ]
                 });
             }
 
@@ -1060,75 +1328,122 @@ client.on("interactionCreate", async interaction => {
         if (interaction.commandName === "scan") {
             await interaction.deferReply({ ephemeral: true });
 
-            let members;
-            try {
-                members = await interaction.guild.members.fetch();
-            } catch (error) {
-                console.error(error);
-                return interaction.editReply({
-                    embeds: [
-                        errorEmbed(
-                            "I couldn't retrieve the server member list. Make sure **Server Members Intent** is enabled."
+            // /scan now reports verification status across EVERY server the bot
+            // can see. Each server uses its own configured Verified role.
+            const sections = [];
+            let totalVerified = 0;
+            let totalUnverified = 0;
+            let totalFlagged = 0;
+
+            for (const guild of client.guilds.cache.values()) {
+                const config = getGuildConfig(guild.id);
+
+                if (!config?.verifiedRoleId) {
+                    sections.push(`### ${guild.name}\n⚠️ No Verified role configured.`);
+                    continue;
+                }
+
+                let members;
+                try {
+                    members = await getGuildMembersForMaintenance(guild);
+                } catch (error) {
+                    console.error(`Scan failed in ${guild.name}:`, error);
+                    sections.push(`### ${guild.name}\n❌ Couldn't retrieve members.`);
+                    continue;
+                }
+
+                const humanMembers = [...members.values()].filter(member => !member.user.bot);
+                const verifiedMembers = humanMembers.filter(member =>
+                    member.roles.cache.has(config.verifiedRoleId)
+                );
+
+                const unverifiedMembers = humanMembers.filter(member =>
+                    !member.roles.cache.has(config.verifiedRoleId) &&
+                    !isWhitelisted(guild.id, member.id)
+                );
+
+                totalVerified += verifiedMembers.length;
+                totalUnverified += unverifiedMembers.length;
+
+                const flagged = [];
+                for (const member of humanMembers) {
+                    if (isWhitelisted(guild.id, member.id)) continue;
+
+                    const matches = await checkUserAgainstLeakServers(member.id);
+                    if (matches.length) {
+                        flagged.push({ member, matches });
+                        saveDetection(guild.id, member.id, matches);
+                    }
+                }
+                totalFlagged += flagged.length;
+
+                const verifiedLines = verifiedMembers.length
+                    ? verifiedMembers
+                        .sort((a, b) => a.user.username.localeCompare(b.user.username))
+                        .map(member => `✅ ${member.user.username} (<@${member.id}>)`)
+                    : ["*No verified users found.*"];
+
+                const flaggedLines = flagged.length
+                    ? [
+                        "",
+                        `🚨 **Caught: ${flagged.length}**`,
+                        ...flagged.slice(0, 10).map(({ member, matches }) =>
+                            `🐀 ${member.user.username} → ${matches.map(m => m.name).join(", ")}`
                         )
                     ]
-                });
+                    : [];
+
+                sections.push(
+                    `### ${guild.name}\n` +
+                    `**Verified role:** <@&${config.verifiedRoleId}>\n` +
+                    `**Verified: ${verifiedMembers.length} | Unverified: ${unverifiedMembers.length}**\n\n` +
+                    verifiedLines.join("\n") +
+                    flaggedLines.join("\n")
+                );
             }
 
-            const membersToCheck = members.filter(
-                m => !m.user.bot && !isWhitelisted(interaction.guildId, m.id)
-            );
+            const header =
+                `🌱 **PROFESSIONAL GRASS — ALL SERVER VERIFICATION SCAN**\n\n` +
+                `🌐 Servers: **${client.guilds.cache.size}**\n` +
+                `✅ Verified: **${totalVerified}**\n` +
+                `⚪ Unverified: **${totalUnverified}**\n` +
+                `🚨 Caught: **${totalFlagged}**\n\n`;
 
-            const flagged = [];
-            let checked = 0;
-            let unverified = 0;
+            const pages = [];
+            let current = header;
 
-            for (const member of membersToCheck.values()) {
-                const matches = await checkUserAgainstLeakServers(member.id);
-                checked++;
-
-                if (matches.length) {
-                    flagged.push({ user: member.user, matches });
-                    saveDetection(interaction.guildId, member.id, matches);
-                } else if (!isVerified(member.id)) {
-                    unverified++;
+            for (const section of sections) {
+                if ((current + "\n\n" + section).length > 3900) {
+                    pages.push(current);
+                    current = section;
+                } else {
+                    current += (current ? "\n\n" : "") + section;
                 }
             }
+            if (current) pages.push(current);
 
-            const summary =
-                `🔎 Checked **${checked}** members.\n` +
-                `⚪ **${unverified}** haven't verified yet, so they couldn't be checked.\n\n`;
+            await interaction.editReply({
+                embeds: [
+                    baseEmbed()
+                        .setTitle("🔎 ALL SERVER VERIFICATION SCAN")
+                        .setDescription(pages[0] || "No servers available.")
+                ]
+            });
 
-            if (!flagged.length) {
-                return interaction.editReply({
+            // Discord embeds have size limits, so send additional pages as
+            // ephemeral follow-ups when the verified-user list is long.
+            for (let i = 1; i < pages.length; i++) {
+                await interaction.followUp({
                     embeds: [
-                        successEmbed(
-                            "SCAN COMPLETE",
-                            summary + `✅ No known matches among verified members.\n\n🌱 The lawn is clean (so far).`
-                        )
-                    ]
+                        baseEmbed()
+                            .setTitle(`🔎 VERIFICATION SCAN — PAGE ${i + 1}`)
+                            .setDescription(pages[i])
+                    ],
+                    ephemeral: true
                 });
             }
 
-            const displayed = flagged.slice(0, 20);
-            const lines = displayed.map(result => {
-                const serverNames = result.matches.map(m => m.name).join(", ");
-                return `🐀 <@${result.user.id}>\n↳ ${serverNames}`;
-            });
-
-            let description = summary + `🚨 Found **${flagged.length}** match(es).\n\n` + lines.join("\n\n");
-
-            if (flagged.length > 20) {
-                description += `\n\n*...and ${flagged.length - 20} more.*`;
-            }
-
-            return interaction.editReply({
-                embeds: [
-                    baseEmbed()
-                        .setColor(0xed4245)
-                        .setTitle("🚨 THE GRASS HAS SPOKEN")
-                        .setDescription(description.slice(0, 4000))
-                ]
-            });
+            return;
         }
 
         // ==================================================
