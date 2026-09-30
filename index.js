@@ -136,7 +136,7 @@ saveDatabase();
 // ==========================================================
 
 const client = new Client({
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
+    intents: [GatewayIntentBits.Guilds],
     partials: [Partials.GuildMember]
 });
 
@@ -1614,14 +1614,34 @@ for (const signal of ["SIGTERM", "SIGINT"]) {
 // ==========================================================
 
 async function start() {
+    console.log("🔑 Attempting Discord login...");
+
+    // Start command registration independently. A Discord REST problem must never
+    // prevent the Gateway client from connecting and answering interactions.
+    registerCommands()
+        .then(() => console.log("🌱 Command registration task finished."))
+        .catch(error => {
+            console.error("❌ Global command registration failed:");
+            console.error(error);
+        });
+
     try {
-        await registerCommands();
-        await client.login(TOKEN);
+        const loginTimeout = new Promise((_, reject) =>
+            setTimeout(() => reject(new Error("Discord login timed out after 30 seconds")), 30000)
+        );
+        await Promise.race([client.login(TOKEN), loginTimeout]);
+        console.log("✅ Discord login request accepted; waiting for ClientReady...");
     } catch (error) {
-        console.error("❌ PROFESSIONAL GRASS FAILED TO START");
+        console.error("❌ PROFESSIONAL GRASS FAILED TO LOGIN");
         console.error(error);
+        console.error("Check BOT_TOKEN and Discord Developer Portal > Bot settings.");
         process.exit(1);
     }
 }
+
+client.on("shardError", error => console.error("❌ Discord shard error:", error));
+client.on("shardDisconnect", (event, shardId) =>
+    console.error(`❌ Discord shard ${shardId} disconnected: ${event.code} ${event.reason || ""}`)
+);
 
 start();
